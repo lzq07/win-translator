@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 # 项目根目录（translator/ 的上一级）
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_PATH = BASE_DIR / ".env"
+ASSETS_DIR = BASE_DIR / "assets"
+ICON_PATH = ASSETS_DIR / "icon.ico"
 
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
@@ -44,7 +46,7 @@ class Config:
         return f"{self.base_url.rstrip('/')}/chat/completions"
 
 
-def _clean(value: str | None) -> str:
+def clean_value(value: str | None) -> str:
     """去掉首尾空白与包裹的引号（.env 里写成 "xxx" 也能正常读）。"""
     if value is None:
         return ""
@@ -68,7 +70,7 @@ def load_config(override: bool = True) -> Config:
     """
     load_dotenv(ENV_PATH, override=override)
 
-    api_key = _clean(os.getenv("DEEPSEEK_API_KEY"))
+    api_key = clean_value(os.getenv("DEEPSEEK_API_KEY"))
     if api_key in PLACEHOLDER_KEYS:
         raise ValueError(
             f"未检测到有效的 DEEPSEEK_API_KEY。\n"
@@ -77,8 +79,8 @@ def load_config(override: bool = True) -> Config:
 
     return Config(
         api_key=api_key,
-        base_url=_clean(os.getenv("DEEPSEEK_BASE_URL")) or DEFAULT_BASE_URL,
-        model=_clean(os.getenv("DEEPSEEK_MODEL")) or DEFAULT_MODEL,
+        base_url=clean_value(os.getenv("DEEPSEEK_BASE_URL")) or DEFAULT_BASE_URL,
+        model=clean_value(os.getenv("DEEPSEEK_MODEL")) or DEFAULT_MODEL,
         timeout=DEFAULT_TIMEOUT,
     )
 

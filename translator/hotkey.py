@@ -1,8 +1,11 @@
-"""全局快捷键模块：注册并监听 Ctrl+Alt+T / Ctrl+Alt+Z。
+"""全局快捷键模块：注册并监听划词 / 截图两组快捷键。
+
+组合键可在设置界面里自定义，`register_hotkeys()` 会先注销旧的再注册新的，
+因此改完设置可以直接调用它让新快捷键立即生效。
 
 注意：
     回调运行在 keyboard 库的钩子线程里，不是 Qt 主线程。
-    因此这里不直接操作界面，只把"动作"放进队列，
+    因此这里不直接操作界面，只把「动作」放进队列，
     由 main.py 的 QTimer 在主线程里取出执行（drain_actions）。
 """
 
@@ -14,15 +17,17 @@ import time
 
 import keyboard
 
-TRANSLATE_HOTKEY = "ctrl+alt+t"
-SNIP_HOTKEY = "ctrl+alt+z"
-
-# 组合键里的主键名，用于判断是否仍被按住
-TRANSLATE_KEY = "t"
-SNIP_KEY = "z"
+DEFAULT_TRANSLATE_HOTKEY = "ctrl+alt+t"
+DEFAULT_SNIP_HOTKEY = "ctrl+alt+z"
 
 ACTION_TRANSLATE = "translate"
 ACTION_SNIP = "snip"
+
+# 认为是修饰键的名字
+MODIFIER_NAMES = {"ctrl", "control", "alt", "shift", "windows", "win", "cmd"}
+
+# 组合键最多允许的片段数（含主键）
+MAX_HOTKEY_PARTS = 4
 
 # 同一动作在该时间窗内的重复触发视为同一次（秒）
 DEBOUNCE_SECONDS = 0.5
@@ -36,20 +41,76 @@ _LOCK = threading.Lock()
 _LAST_FIRED: dict = {}
 # 主键当前是否仍被按住：按住期间产生的一律是键盘自动重复
 _HELD: dict = {}
+# 当前生效的组合键
+_CURRENT: dict = {
+    ACTION_TRANSLATE: DEFAULT_TRANSLATE_HOTKEY,
+    ACTION_SNIP: DEFAULT_SNIP_HOTKEY,
+}
 
 __all__ = [
-    "TRANSLATE_HOTKEY",
-    "SNIP_HOTKEY",
-    "ACTION_TRANSLATE",
     "ACTION_SNIP",
+    "ACTION_TRANSLATE",
+    "DEFAULT_SNIP_HOTKEY",
+    "DEFAULT_TRANSLATE_HOTKEY",
+    "MODIFIER_NAMES",
+    "clear_actions",
+    "current_hotkeys",
+    "drain_actions",
     "register_hotkeys",
     "unregister_hotkeys",
-    "on_translate_hotkey",
-    "on_snip_hotkey",
+    "validate_hotkey",
     "wait_for_modifiers_release",
-    "drain_actions",
-    "clear_actions",
 ]
+
+
+# ---------- 组合键校验 ----------
+
+
+def validate_hotkey(text: str) -> str | None:
+    """检查组合键字符串是否可用。
+
+    Args:
+        text: 形如 "ctrl+alt+t" 的组合键。
+
+    Returns:
+        str | None: 合法时返回 None，否则返回错误说明。
+    """
+    value = (text or "").strip().lower()
+    if not value:
+        return "不能为空。"
+    if "," in value:
+        return "不支持多段组合键（不能包含逗号）。"
+
+    parts = [p.strip() for p in value.split("+") if p.strip()]
+    if len(parts) < 2:
+        return "至少需要一个修饰键，例如 ctrl+alt+t。"
+    if len(parts) > MAX_HOTKEY_PARTS:
+        return f"最多 {MAX_HOTKEY_PARTS} 个键。"
+    if not any(p in MODIFIER_NAMES for p in parts[:-1]):
+        return "至少要有一个修饰键（ctrl / alt / shift），否则会干扰正常打字。"
+    if parts[-1] in MODIFIER_NAMES:
+        return "最后一位必须是普通按键，不能是修饰键。"
+
+    try:
+        keyboard.parse_hotkey(value)
+    except Exception as exc:  # noqa: BLE001 - 库内部抛的异常类型不固定
+        # keyboard 抛的异常 args 可能是个元组，取出第一条更干净
+        detail = exc.args[0] if getattr(exc, "args", None) else exc
+        return f"无法识别的按键：{detail}"
+    return None
+
+
+def _main_key(hotkey_text: str) -> str:
+    """取出组合键里的主键名，用于跟踪是否仍被按住。"""
+    return hotkey_text.split("+")[-1].strip().lower()
+
+
+def current_hotkeys() -> dict:
+    """返回当前生效的组合键。"""
+    return dict(_CURRENT)
+
+
+# ---------- 队列与事件 ----------
 
 
 def _emit(action: str, key: str) -> None:
@@ -83,60 +144,70 @@ def _on_key_release(event=None) -> None:
         _HELD[name] = False
 
 
-def on_translate_hotkey() -> None:
-    """Ctrl+Alt+T：划词翻译的回调（运行在钩子线程）。"""
-    _emit(ACTION_TRANSLATE, TRANSLATE_KEY)
+def _make_callback(action: str, key: str):
+    """生成绑定到具体动作与主键的回调。"""
+
+    def callback() -> None:
+        _emit(action, key)
+
+    return callback
 
 
-def on_snip_hotkey() -> None:
-    """Ctrl+Alt+Z：截图翻译的回调（运行在钩子线程）。"""
-    _emit(ACTION_SNIP, SNIP_KEY)
+# ---------- 注册 / 注销 ----------
 
 
-def register_hotkeys(enable_snip: bool = False, trigger_on_release: bool = False) -> None:
-    """注册全局快捷键。
+def _register_one(action: str, hotkey_text: str, trigger_on_release: bool) -> None:
+    """注册单个组合键，并挂上主键的松开监听。"""
+    key = _main_key(hotkey_text)
+    _HOOKS.append(
+        keyboard.add_hotkey(
+            hotkey_text,
+            _make_callback(action, key),
+            trigger_on_release=trigger_on_release,
+        )
+    )
+    _RELEASE_HOOKS.append(keyboard.on_release_key(key, _on_key_release))
 
-    默认在**按下**时触发（trigger_on_release=False）。
-    源码里 trigger_on_release=True 会走 KEY_UP 分支，带修饰键的组合键在该路径下常不触发，
-    因此改用按下触发；"按下瞬间 Ctrl/Alt 仍被按住会导致模拟 Ctrl+C 变成 Ctrl+Alt+C"
-    这个问题改由 wait_for_modifiers_release() 在取词前等待物理松开来规避。
+
+def register_hotkeys(
+    translate_hotkey: str = DEFAULT_TRANSLATE_HOTKEY,
+    snip_hotkey: str = DEFAULT_SNIP_HOTKEY,
+    enable_snip: bool = True,
+    trigger_on_release: bool = False,
+) -> None:
+    """注册全局快捷键（会先注销已有注册，可直接用于改键后生效）。
 
     Args:
-        enable_snip: 是否同时注册截图快捷键，默认关闭（OCR 未实现）。
-        trigger_on_release: 是否在松开时触发，默认 False。
+        translate_hotkey: 划词翻译组合键。
+        snip_hotkey: 截图翻译组合键。
+        enable_snip: 是否注册截图快捷键。
+        trigger_on_release: 是否在松开时触发，默认按下即触发。
 
     Raises:
-        Exception: keyboard 注册失败时向上抛出，由调用方提示用户。
+        ValueError: 组合键格式不合法。
+        Exception: keyboard 库注册失败（例如没有权限）。
     """
-    global _HOOKS, _RELEASE_HOOKS
-    with _LOCK:
-        if _HOOKS:
-            return
-        _HOOKS.append(
-            keyboard.add_hotkey(
-                TRANSLATE_HOTKEY,
-                on_translate_hotkey,
-                trigger_on_release=trigger_on_release,
-            )
-        )
-        if enable_snip:
-            _HOOKS.append(
-                keyboard.add_hotkey(
-                    SNIP_HOTKEY,
-                    on_snip_hotkey,
-                    trigger_on_release=trigger_on_release,
-                )
-            )
+    for label, value in (
+        ("划词翻译", translate_hotkey),
+        ("截图翻译", snip_hotkey),
+    ):
+        error = validate_hotkey(value)
+        if error:
+            raise ValueError(f"{label}快捷键「{value}」不合法：{error}")
 
-        # 监听主键松开（按扫描码分发，不受修饰键影响），用于清除「按住」标记
-        if not _RELEASE_HOOKS:
-            for key in (TRANSLATE_KEY, SNIP_KEY):
-                _RELEASE_HOOKS.append(keyboard.on_release_key(key, _on_key_release))
+    unregister_hotkeys()
+
+    with _LOCK:
+        _CURRENT[ACTION_TRANSLATE] = translate_hotkey.strip().lower()
+        _CURRENT[ACTION_SNIP] = snip_hotkey.strip().lower()
+        _register_one(ACTION_TRANSLATE, translate_hotkey, trigger_on_release)
+        if enable_snip:
+            _register_one(ACTION_SNIP, snip_hotkey, trigger_on_release)
 
 
 def unregister_hotkeys() -> None:
     """注销已注册的全局快捷键。"""
-    global _HOOKS
+    global _HOOKS, _RELEASE_HOOKS
     with _LOCK:
         for hook in _HOOKS:
             try:
@@ -151,6 +222,9 @@ def unregister_hotkeys() -> None:
             except Exception:  # noqa: BLE001
                 pass
         _RELEASE_HOOKS.clear()
+
+        # 主键可能已经变了，清空按住标记重新开始
+        _HELD.clear()
 
 
 def wait_for_modifiers_release(timeout: float = 1.0) -> bool:
@@ -171,6 +245,9 @@ def wait_for_modifiers_release(timeout: float = 1.0) -> bool:
             return False
         time.sleep(0.02)
     return False
+
+
+# ---------- 供主线程消费 ----------
 
 
 def drain_actions() -> list[str]:

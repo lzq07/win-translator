@@ -21,6 +21,7 @@ env/
 
 # 打包产物
 *.spec
+dist/
 
 # 测试截图产物
 snip_test.png

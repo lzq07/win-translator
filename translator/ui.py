@@ -6,6 +6,7 @@ import sys
 
 from PyQt6.QtCore import QPoint, QRect, Qt, pyqtSignal
 from PyQt6.QtGui import (
+    QAction,
     QColor,
     QFont,
     QGuiApplication,
@@ -16,17 +17,48 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QMenu,
     QPushButton,
     QSizeGrip,
+    QSpinBox,
     QSplitter,
+    QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-__all__ = ["ResultWindow", "SnipOverlay", "ensure_app", "virtual_desktop_rect"]
+from .config import DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_TIMEOUT
+from .hotkey import (
+    DEFAULT_SNIP_HOTKEY,
+    DEFAULT_TRANSLATE_HOTKEY,
+    validate_hotkey,
+)
+from .settings import (
+    SUGGESTED_MODELS,
+    build_config,
+    save_user_settings,
+    settings_path,
+)
+
+APP_TITLE = "划词 & 截图翻译"
+
+__all__ = [
+    "APP_TITLE",
+    "ResultWindow",
+    "SettingsWindow",
+    "SnipOverlay",
+    "TrayIcon",
+    "ensure_app",
+    "virtual_desktop_rect",
+]
 
 
 def virtual_desktop_rect() -> QRect:
@@ -61,8 +93,54 @@ QPushButton {
 }
 QPushButton:hover { background: #3a465c; }
 QPushButton:pressed { background: #232b3a; }
+QPushButton:disabled { color: #5a6474; background: #252b36; }
 QSplitter::handle { background: #2c3444; height: 4px; }
 QSplitter::handle:hover { background: #3d5afe; }
+QLineEdit, QComboBox, QSpinBox {
+    background: #171b24;
+    border: 1px solid #2c3444;
+    border-radius: 6px;
+    padding: 6px 8px;
+    color: #e6e6e6;
+    font-size: 13px;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #3d5afe; }
+QComboBox QAbstractItemView {
+    background: #1f2430;
+    color: #e6e6e6;
+    border: 1px solid #2c3444;
+    selection-background-color: #3d5afe;
+}
+QCheckBox { color: #9aa4b2; font-size: 12px; }
+QFormLayout QLabel { color: #c3cad6; font-size: 13px; }
+QGroupBox {
+    border: 1px solid #2c3444;
+    border-radius: 8px;
+    margin-top: 12px;
+    padding: 12px 12px 10px 12px;
+    font-size: 13px;
+    color: #8f9aab;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 5px;
+}
+"""
+
+# 托盘右键菜单单独一份样式（菜单是独立顶层窗口，不继承窗口的样式表）
+MENU_STYLE = """
+QMenu {
+    background: #1f2430;
+    color: #e6e6e6;
+    border: 1px solid #2c3444;
+    padding: 4px;
+    font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+}
+QMenu::item { padding: 6px 26px 6px 14px; border-radius: 4px; }
+QMenu::item:selected { background: #3d5afe; }
+QMenu::separator { height: 1px; background: #2c3444; margin: 4px 8px; }
 """
 
 
@@ -467,3 +545,268 @@ class SnipOverlay(QWidget):
             self.confirm()
         else:
             super().keyPressEvent(event)
+
+
+class SettingsWindow(QWidget):
+    """设置界面：配置翻译服务（API Key / 接口地址 / 模型）与全局快捷键。
+
+    保存后发出 saved(dict)，由 main.py 重新加载配置，并让新快捷键立即生效。
+
+    信号：
+        saved(dict): 保存成功，携带完整的设置字典。
+    """
+
+    saved = pyqtSignal(dict)
+
+    def __init__(self, parent: QWidget | None = None, test_callback=None):
+        """
+        Args:
+            parent: 父窗口。
+            test_callback: 形如 func(Config) -> str 的连通性测试函数；
+                为 None 时「测试连接」按钮禁用。
+        """
+        super().__init__(parent)
+        self._test_callback = test_callback
+        self._build_ui()
+
+    def _build_ui(self):
+        self.setWindowTitle("设置 · 划词与截图翻译")
+        self.setMinimumWidth(560)
+        self.setWindowFlags(
+            Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
+        )
+        self.setStyleSheet(WINDOW_STYLE)
+
+        # API Key（密码框 + 显示开关）
+        self._key = QLineEdit()
+        self._key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._key.setPlaceholderText("sk-...（在服务商后台创建）")
+
+        chk_show = QCheckBox("显示")
+        chk_show.toggled.connect(self._on_toggle_key)
+
+        key_row = QHBoxLayout()
+        key_row.setContentsMargins(0, 0, 0, 0)
+        key_row.setSpacing(6)
+        key_row.addWidget(self._key, 1)
+        key_row.addWidget(chk_show)
+        key_box = QWidget()
+        key_box.setLayout(key_row)
+
+        self._base_url = QLineEdit()
+        self._base_url.setPlaceholderText(DEFAULT_BASE_URL)
+
+        self._model = QComboBox()
+        self._model.setEditable(True)  # 允许填候选之外的模型
+        self._model.addItems(SUGGESTED_MODELS)
+
+        self._timeout = QSpinBox()
+        self._timeout.setRange(5, 300)
+        self._timeout.setSuffix(" 秒")
+
+        service_form = QFormLayout()
+        service_form.setContentsMargins(0, 0, 0, 0)
+        service_form.setSpacing(10)
+        service_form.addRow("API Key", key_box)
+        service_form.addRow("接口地址", self._base_url)
+        service_form.addRow("模型", self._model)
+        service_form.addRow("超时", self._timeout)
+
+        service_box = QGroupBox("翻译服务")
+        service_box.setLayout(service_form)
+
+        # 全局快捷键
+        self._hk_translate = QLineEdit()
+        self._hk_translate.setPlaceholderText(DEFAULT_TRANSLATE_HOTKEY)
+
+        self._hk_snip = QLineEdit()
+        self._hk_snip.setPlaceholderText(DEFAULT_SNIP_HOTKEY)
+
+        hotkey_form = QFormLayout()
+        hotkey_form.setContentsMargins(0, 0, 0, 0)
+        hotkey_form.setSpacing(10)
+        hotkey_form.addRow("划词翻译", self._hk_translate)
+        hotkey_form.addRow("截图翻译", self._hk_snip)
+
+        hotkey_hint = QLabel(
+            "格式示例：ctrl+alt+t。至少要有一个修饰键（ctrl / alt / shift），"
+            "否则会干扰正常打字。"
+        )
+        hotkey_hint.setWordWrap(True)
+        hotkey_hint.setStyleSheet("color: #7f8a99; font-size: 12px;")
+
+        hotkey_inner = QVBoxLayout()
+        hotkey_inner.setContentsMargins(0, 0, 0, 0)
+        hotkey_inner.setSpacing(8)
+        hotkey_inner.addLayout(hotkey_form)
+        hotkey_inner.addWidget(hotkey_hint)
+
+        hotkey_box = QGroupBox("全局快捷键")
+        hotkey_box.setLayout(hotkey_inner)
+
+        self._status = QLabel()
+        self._status.setWordWrap(True)
+        self._set_status(f"配置将保存在：{settings_path()}")
+
+        self._btn_test = QPushButton("测试连接")
+        self._btn_test.clicked.connect(self._on_test)
+        self._btn_test.setEnabled(self._test_callback is not None)
+
+        btn_save = QPushButton("保存")
+        btn_save.clicked.connect(self._on_save)
+        btn_close = QPushButton("取消")
+        btn_close.clicked.connect(self.close)
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self._btn_test)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_close)
+        btn_row.addWidget(btn_save)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 14)
+        layout.setSpacing(12)
+        layout.addWidget(service_box)
+        layout.addWidget(hotkey_box)
+        layout.addWidget(self._status)
+        layout.addLayout(btn_row)
+
+        QShortcut(QKeySequence("Esc"), self, activated=self.close)
+
+    # ---------- 对外 ----------
+
+    def load_from(self, data: dict) -> None:
+        """把设置字典填进控件。"""
+        self._key.setText(str(data.get("api_key") or ""))
+        self._base_url.setText(str(data.get("base_url") or DEFAULT_BASE_URL))
+        self._model.setCurrentText(str(data.get("model") or DEFAULT_MODEL))
+        try:
+            timeout = float(data.get("timeout") or DEFAULT_TIMEOUT)
+        except (TypeError, ValueError):
+            timeout = DEFAULT_TIMEOUT
+        self._timeout.setValue(int(timeout))
+        self._hk_translate.setText(
+            str(data.get("hotkey_translate") or DEFAULT_TRANSLATE_HOTKEY)
+        )
+        self._hk_snip.setText(str(data.get("hotkey_snip") or DEFAULT_SNIP_HOTKEY))
+        self._set_status(f"配置将保存在：{settings_path()}")
+
+    def collect(self) -> dict:
+        """收集控件当前的值。"""
+        return {
+            "api_key": self._key.text().strip(),
+            "base_url": self._base_url.text().strip() or DEFAULT_BASE_URL,
+            "model": self._model.currentText().strip() or DEFAULT_MODEL,
+            "timeout": float(self._timeout.value()),
+            "hotkey_translate": self._hk_translate.text().strip()
+            or DEFAULT_TRANSLATE_HOTKEY,
+            "hotkey_snip": self._hk_snip.text().strip() or DEFAULT_SNIP_HOTKEY,
+        }
+
+    def open_settings(self) -> None:
+        """显示窗口并置顶。"""
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._key.setFocus()
+
+    # ---------- 内部 ----------
+
+    def _set_status(self, message: str, error: bool = False) -> None:
+        color = "#ff8a80" if error else "#9aa4b2"
+        self._status.setStyleSheet(f"color: {color}; font-size: 12px;")
+        self._status.setText(message)
+
+    def _on_toggle_key(self, checked: bool) -> None:
+        self._key.setEchoMode(
+            QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+        )
+
+    def _on_test(self) -> None:
+        config = build_config(self.collect())
+        if config is None:
+            self._set_status("请先填写 API Key。", error=True)
+            return
+        if self._test_callback is None:
+            self._set_status("当前环境不支持测试连接。", error=True)
+            return
+
+        self._set_status("正在测试…")
+        self._btn_test.setEnabled(False)
+        QApplication.processEvents()
+        try:
+            sample = self._test_callback(config)
+            self._set_status(f"连接成功，返回：{sample[:60]}")
+        except Exception as exc:  # noqa: BLE001 - 需要把错误展示给用户
+            self._set_status(f"连接失败：{exc}", error=True)
+        finally:
+            self._btn_test.setEnabled(True)
+
+    def _on_save(self) -> None:
+        data = self.collect()
+        if build_config(data) is None:
+            self._set_status("API Key 不能为空。", error=True)
+            return
+
+        for label, field in (
+            ("划词翻译", "hotkey_translate"),
+            ("截图翻译", "hotkey_snip"),
+        ):
+            error = validate_hotkey(data[field])
+            if error:
+                self._set_status(f"{label}快捷键不合法：{error}", error=True)
+                return
+
+        try:
+            save_user_settings(data)
+        except OSError as exc:
+            self._set_status(f"保存失败：{exc}", error=True)
+            return
+
+        self.saved.emit(data)
+        self.close()
+
+
+class TrayIcon(QSystemTrayIcon):
+    """托盘图标：常驻后台时的操作入口。
+
+    信号：
+        double_clicked(): 双击托盘图标。
+    """
+
+    double_clicked = pyqtSignal()
+
+    def __init__(self, icon, parent: QWidget | None = None):
+        super().__init__(icon, parent)
+        self.setToolTip(APP_TITLE)
+
+        menu = QMenu()
+        menu.setStyleSheet(MENU_STYLE)
+        self.action_translate = QAction("划词翻译（Ctrl+Alt+T）", menu)
+        self.action_snip = QAction("截图翻译（Ctrl+Alt+Z）", menu)
+        self.action_settings = QAction("设置…", menu)
+        self.action_quit = QAction("退出", menu)
+
+        menu.addAction(self.action_translate)
+        menu.addAction(self.action_snip)
+        menu.addSeparator()
+        menu.addAction(self.action_settings)
+        menu.addSeparator()
+        menu.addAction(self.action_quit)
+
+        self._menu = menu  # 保持引用，避免被回收
+        self.setContextMenu(menu)
+        self.activated.connect(self._on_activated)
+
+    def _on_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.double_clicked.emit()
+
+    def notify(self, title: str, message: str) -> None:
+        """弹一个托盘气泡提示。"""
+        self.showMessage(
+            title,
+            message,
+            QSystemTrayIcon.MessageIcon.Information,
+            3000,
+        )
